@@ -1,8 +1,7 @@
-# vinext-starter
+# Flip Seven browser game
 
-A clean full-stack starter running on
-[vinext](https://github.com/cloudflare/vinext), with optional Cloudflare D1 and
-Drizzle support.
+A one-device, pass-and-play card game built with Next.js and ready to deploy on
+Vercel.
 
 ## Prerequisites
 
@@ -16,7 +15,8 @@ npm run dev
 npm run build
 ```
 
-This starter does not use `wrangler.jsonc`.
+Create a production build with `npm run build`, then deploy through a connected
+Git repository or with `npx vercel --prod`.
 
 ## Included Shape
 
