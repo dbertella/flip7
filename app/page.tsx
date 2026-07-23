@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 
 type NumberCard = { id: string; kind: "number"; value: number };
 type ModifierCard = { id: string; kind: "modifier"; value: 2 | 4 | 6 | 8 | 10; label: string };
@@ -22,10 +22,11 @@ type Player = {
   flip7: boolean;
 };
 
-type ForcedDraw = { playerId: string; remaining: number } | null;
+type ForcedDraw = { playerId: string; remaining: number; resumeFromId: string } | null;
 type PendingAction = { card: ActionCard; sourceId: string } | null;
+type SoundKind = "flip" | "stay" | "bust" | "roundWin" | "gameWin";
 
-const TARGET_SCORE = 200;
+const SCORE_OPTIONS = [50, 100, 150, 200] as const;
 const colors = ["coral", "gold", "teal", "plum", "sky", "rose", "lime", "amber"];
 
 function createDeck(): Card[] {
@@ -109,12 +110,22 @@ export default function Home() {
   const [pendingAction, setPendingAction] = useState<PendingAction>(null);
   const [forcedDraw, setForcedDraw] = useState<ForcedDraw>(null);
   const [showRules, setShowRules] = useState(false);
+  const [targetScore, setTargetScore] = useState<number>(200);
+  const [soundOn, setSoundOn] = useState(true);
+  const [bustCards, setBustCards] = useState<Record<string, string>>({});
+  const audioContextRef = useRef<AudioContext | null>(null);
 
   const activePlayer = players[activeIndex];
   const activeScore = activePlayer ? scoreHand(activePlayer) : 0;
   const activeNumbers = activePlayer
     ? activePlayer.hand.filter((card): card is NumberCard => card.kind === "number").length
     : 0;
+  const roundHigh = roundSummary
+    ? Math.max(...roundSummary.map((player) => scoreHand(player)))
+    : 0;
+  const roundWinners = roundSummary
+    ? roundSummary.filter((player) => scoreHand(player) === roundHigh && roundHigh > 0)
+    : [];
 
   const leaders = useMemo(() => {
     if (!players.length) return [];
@@ -132,6 +143,42 @@ export default function Home() {
 
   function removePlayer(index: number) {
     if (names.length > 2) setNames((current) => current.filter((_, i) => i !== index));
+  }
+
+  function playSound(kind: SoundKind, delay = 0) {
+    if (!soundOn || typeof window === "undefined") return;
+    const AudioContextClass = window.AudioContext ||
+      (window as typeof window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+    if (!AudioContextClass) return;
+    const context = audioContextRef.current || new AudioContextClass();
+    audioContextRef.current = context;
+    if (context.state === "suspended") void context.resume();
+
+    const patterns: Record<SoundKind, Array<[number, number, number, OscillatorType, number]>> = {
+      flip: [[330, 0, .055, "square", .055], [660, .045, .075, "triangle", .04]],
+      stay: [[523, 0, .1, "triangle", .045], [392, .09, .16, "triangle", .05], [262, .19, .24, "sine", .055]],
+      bust: [[260, 0, .13, "sawtooth", .075], [180, .11, .18, "sawtooth", .07], [92, .27, .28, "square", .055]],
+      roundWin: [[392, 0, .13, "square", .045], [523, .12, .13, "square", .045], [659, .24, .15, "square", .05], [784, .37, .3, "triangle", .055]],
+      gameWin: [[392, 0, .18, "square", .05], [523, .11, .18, "square", .05], [659, .22, .2, "square", .055], [784, .34, .24, "triangle", .06], [1047, .5, .48, "triangle", .065]],
+    };
+
+    patterns[kind].forEach(([frequency, offset, duration, wave, volume]) => {
+      const oscillator = context.createOscillator();
+      const gain = context.createGain();
+      const start = context.currentTime + delay + offset;
+      oscillator.type = wave;
+      oscillator.frequency.setValueAtTime(frequency, start);
+      if (kind === "bust") {
+        oscillator.frequency.exponentialRampToValueAtTime(frequency * .62, start + duration);
+      }
+      gain.gain.setValueAtTime(.0001, start);
+      gain.gain.exponentialRampToValueAtTime(volume, start + .018);
+      gain.gain.exponentialRampToValueAtTime(.0001, start + duration);
+      oscillator.connect(gain);
+      gain.connect(context.destination);
+      oscillator.start(start);
+      oscillator.stop(start + duration + .02);
+    });
   }
 
   function startGame() {
@@ -154,6 +201,7 @@ export default function Home() {
     setRoundSummary(null);
     setPendingAction(null);
     setForcedDraw(null);
+    setBustCards({});
     setScreen("game");
   }
 
@@ -162,11 +210,13 @@ export default function Home() {
     setPlayers([]);
     setLastCard(null);
     setRoundSummary(null);
+    setBustCards({});
   }
 
   function drawTopCard(): { card: Card; nextDeck: Card[] } {
     if (deck.length) return { card: deck[0], nextDeck: deck.slice(1) };
     const recycled = shuffle(discard);
+    setDiscard([]);
     return { card: recycled[0], nextDeck: recycled.slice(1) };
   }
 
@@ -180,6 +230,7 @@ export default function Home() {
     setPendingAction(null);
     setForcedDraw(null);
     setNotice(message || "Round complete. Points are on the board.");
+    playSound("roundWin", .55);
   }
 
   function handOff(updatedPlayers: Player[], fromIndex: number, message: string) {
@@ -216,8 +267,10 @@ export default function Home() {
           continueAfterDraw(updated, playerIndex, message);
           return;
         }
+        player.hand.push(card);
         player.status = "busted";
-        setDiscard((current) => [...current, card]);
+        setBustCards((current) => ({ ...current, [player.id]: card.id }));
+        playSound("bust", .08);
         setPlayers(updated);
         const message = `${player.name} flipped another ${card.value} and busted.`;
         setNotice(message);
@@ -257,24 +310,29 @@ export default function Home() {
     if (forcedDraw && forcedDraw.playerId === updated[playerIndex].id) {
       const remaining = forcedDraw.remaining - 1;
       if (remaining > 0 && !playerOut && updated[playerIndex].status === "playing") {
-        setForcedDraw({ playerId: forcedDraw.playerId, remaining });
+        setForcedDraw({ ...forcedDraw, remaining });
         setActiveIndex(playerIndex);
         setPlayers(updated);
         return;
       }
+      const resumeIndex = updated.findIndex((player) => player.id === forcedDraw.resumeFromId);
       setForcedDraw(null);
+      handOff(updated, resumeIndex >= 0 ? resumeIndex : playerIndex, message);
+      return;
     }
     handOff(updated, playerIndex, message);
   }
 
   function drawCard() {
     if (!activePlayer || activePlayer.status !== "playing" || pendingAction || roundSummary) return;
+    playSound("flip");
     const { card, nextDeck } = drawTopCard();
     resolveCardFor(activeIndex, card, nextDeck);
   }
 
   function stay() {
     if (!activePlayer || activePlayer.hand.length === 0 || forcedDraw) return;
+    playSound("stay");
     const updated = players.map((player, index) =>
       index === activeIndex ? { ...player, status: "stayed" as const } : player,
     );
@@ -301,18 +359,28 @@ export default function Home() {
       );
       setNotice(`${target.name} was frozen and banks ${scoreHand(target)} points.`);
       if (forcedDraw?.playerId === targetId) setForcedDraw(null);
-      handOff(updated, sourceIndex, `${target.name} was frozen and is safe for the round.`);
+      if (forcedDraw?.playerId === pendingAction.sourceId) {
+        continueAfterDraw(
+          updated,
+          sourceIndex,
+          `${target.name} was frozen and is safe for the round.`,
+          updated[sourceIndex].status !== "playing",
+        );
+      } else {
+        handOff(updated, sourceIndex, `${target.name} was frozen and is safe for the round.`);
+      }
       return;
     }
-    setForcedDraw({ playerId: targetId, remaining: 3 });
+    setForcedDraw({ playerId: targetId, remaining: 3, resumeFromId: pendingAction.sourceId });
     setActiveIndex(targetIndex);
     setPlayers(actionResolvedPlayers);
     setNotice(`${target.name} must flip three cards.`);
   }
 
   function nextRound() {
-    const hasWinner = players.some((player) => player.total >= TARGET_SCORE);
+    const hasWinner = players.some((player) => player.total >= targetScore);
     if (hasWinner) {
+      playSound("gameWin");
       setRoundSummary(null);
       setScreen("gameOver");
       return;
@@ -324,15 +392,22 @@ export default function Home() {
       status: "playing" as const,
       flip7: false,
     }));
+    const completedRoundCards = players.flatMap((player) => player.hand);
+    const availableDiscard = [...discard, ...completedRoundCards];
+    if (deck.length === 0) {
+      setDeck(shuffle(availableDiscard));
+      setDiscard([]);
+    } else {
+      setDiscard(availableDiscard);
+    }
     setPlayers(renewed);
-    setDeck(createDeck());
-    setDiscard([]);
     setRound((value) => value + 1);
     setActiveIndex(starter);
     setLastCard(null);
     setRoundSummary(null);
     setForcedDraw(null);
     setPendingAction(null);
+    setBustCards({});
     setNotice(`${renewed[starter].name}, draw your first card.`);
   }
 
@@ -389,6 +464,22 @@ export default function Home() {
               <span>+</span> Add another player
             </button>
           )}
+          <fieldset className="goal-selector">
+            <legend>PLAY TO</legend>
+            <div>
+              {SCORE_OPTIONS.map((score) => (
+                <button
+                  key={score}
+                  type="button"
+                  className={targetScore === score ? "selected" : ""}
+                  onClick={() => setTargetScore(score)}
+                  aria-pressed={targetScore === score}
+                >
+                  {score}
+                </button>
+              ))}
+            </div>
+          </fieldset>
           <button className="start-game" onClick={startGame}>
             Start game <span>→</span>
           </button>
@@ -428,8 +519,14 @@ export default function Home() {
         <button className="wordmark" onClick={resetToSetup} aria-label="Return to player setup">
           FLIP <span>SEVEN</span>
         </button>
-        <div className="round-chip">ROUND <strong>{round}</strong></div>
+        <div className="round-chip">ROUND <strong>{round}</strong><span> / {targetScore} PTS</span></div>
         <div className="header-actions">
+          <button
+            className={soundOn ? "sound-on" : ""}
+            onClick={() => setSoundOn((value) => !value)}
+            aria-label={soundOn ? "Mute game sounds" : "Turn on game sounds"}
+            title={soundOn ? "Sound on" : "Sound off"}
+          >{soundOn ? "♫" : "×"}</button>
           <button onClick={() => setShowRules(true)}>?</button>
           <button onClick={resetToSetup} aria-label="Start a new game">↻</button>
         </div>
@@ -461,7 +558,7 @@ export default function Home() {
           <div className="active-card-zone">
             <p>LAST FLIP</p>
             {lastCard ? (
-              <PlayingCard card={lastCard} large />
+              <PlayingCard card={lastCard} large highlighted={Object.values(bustCards).includes(lastCard.id)} />
             ) : (
               <div className="empty-card"><span>?</span><small>READY</small></div>
             )}
@@ -496,7 +593,7 @@ export default function Home() {
                 </div>
                 <div className="player-card-line">
                   {player.hand.length
-                    ? player.hand.map((card) => <PlayingCard card={card} key={card.id} />)
+                    ? player.hand.map((card) => <PlayingCard card={card} key={card.id} highlighted={bustCards[player.id] === card.id} />)
                     : <p className="empty-hand">No cards yet</p>}
                 </div>
               </section>
@@ -532,21 +629,34 @@ export default function Home() {
       {roundSummary && (
         <div className="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="round-title">
           <div className="round-modal">
+            <div className="round-celebration" aria-hidden="true">✦ ★ ✦</div>
             <p className="eyebrow">ROUND {round} COMPLETE</p>
-            <h2 id="round-title">Points on the board</h2>
+            <h2 id="round-title">
+              {roundWinners.length
+                ? `${roundWinners.map((player) => player.name).join(" & ")} ${roundWinners.length > 1 ? "win" : "wins"} the round!`
+                : "No points this round"}
+            </h2>
             <p>{notice}</p>
             <div className="round-results">
               {[...roundSummary].sort((a, b) => scoreHand(b) - scoreHand(a)).map((player, index) => (
-                <div key={player.id} className={index === 0 && scoreHand(player) > 0 ? "round-leader" : ""}>
-                  <span className={`avatar ${colors[players.findIndex((item) => item.id === player.id)]}`}>{player.name.charAt(0)}</span>
-                  <strong>{player.name}</strong>
-                  <small>{player.status === "busted" ? "BUST" : player.flip7 ? "FLIP 7!" : "BANKED"}</small>
-                  <b>+{scoreHand(player)}</b>
-                  <em>{player.total} total</em>
+                <div key={player.id} className={`${index === 0 && scoreHand(player) > 0 ? "round-leader" : ""} ${player.status === "busted" ? "busted-result" : ""}`}>
+                  <div className="round-result-main">
+                    <span className={`avatar ${colors[players.findIndex((item) => item.id === player.id)]}`}>{player.name.charAt(0)}</span>
+                    <strong>{player.name}</strong>
+                    <small>{player.status === "busted" ? "BUST — 0 POINTS" : player.flip7 ? "FLIP 7! +15" : "BANKED"}</small>
+                    <b>+{scoreHand(player)}</b>
+                    <em>{player.total} total</em>
+                  </div>
+                  <div className="summary-hand player-card-line" aria-label={`${player.name}'s final round hand`}>
+                    {player.hand.map((card) => (
+                      <PlayingCard card={card} key={card.id} highlighted={bustCards[player.id] === card.id} />
+                    ))}
+                  </div>
+                  {player.status === "busted" && <span className="bust-stamp">BUSTED!</span>}
                 </div>
               ))}
             </div>
-            <button className="start-game" onClick={nextRound}>{players.some((player) => player.total >= TARGET_SCORE) ? "See winner" : "Next round"}<span>→</span></button>
+            <button className="start-game" onClick={nextRound}>{players.some((player) => player.total >= targetScore) ? "See winner" : "Next round"}<span>→</span></button>
           </div>
         </div>
       )}
@@ -556,15 +666,16 @@ export default function Home() {
   );
 }
 
-function PlayingCard({ card, large = false }: { card: Card; large?: boolean }) {
+function PlayingCard({ card, large = false, highlighted = false }: { card: Card; large?: boolean; highlighted?: boolean }) {
   return (
-    <div className={`playing-card ${cardClass(card)} ${large ? "large" : ""}`}>
+    <div className={`playing-card ${cardClass(card)} ${large ? "large" : ""} ${highlighted ? "bust-cause" : ""}`}>
       <span className="corner top">{cardLabel(card)}</span>
       <strong>{cardLabel(card)}</strong>
       {card.kind === "action" && <small>{card.action === "flip3" ? "DRAW 3" : card.action === "freeze" ? "BANK NOW" : "SAVE A BUST"}</small>}
       {card.kind === "modifier" && <small>BONUS</small>}
       {card.kind === "double" && <small>NUMBER TOTAL</small>}
       <span className="corner bottom">{cardLabel(card)}</span>
+      {highlighted && <span className="bust-label">DUPLICATE</span>}
     </div>
   );
 }
@@ -578,7 +689,7 @@ function RulesModal({ onClose }: { onClose: () => void }) {
           <article><span>01</span><h3>Flip or stay</h3><p>On your turn, take a card or stay and bank your round value. Everyone plays from the same 94-card deck.</p></article>
           <article><span>02</span><h3>Avoid a pair</h3><p>Flip the same number twice and you bust, scoring zero for the round—unless a Second Chance saves you.</p></article>
           <article><span>03</span><h3>Flip seven</h3><p>Collect seven different number cards to end the round immediately and add a 15-point bonus.</p></article>
-          <article><span>04</span><h3>Reach 200</h3><p>Number cards score their face value. ×2 doubles number cards, then + modifiers and the Flip 7 bonus are added.</p></article>
+          <article><span>04</span><h3>Reach the target</h3><p>Choose 50, 100, 150, or 200 before the game. ×2 doubles number cards, then + modifiers and the Flip 7 bonus are added.</p></article>
         </div>
         <div className="special-rules">
           <h3>Special cards</h3>
